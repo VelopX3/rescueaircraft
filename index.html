@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Helium Drone - Flood Rescue Simulation</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #fff;
+            pointer-events: none;
+            background: rgba(10, 15, 20, 0.75);
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #334;
+            backdrop-filter: blur(8px);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            max-width: 300px;
+            z-index: 10;
+        }
+        h2 { margin-top: 0; color: #44aaff; }
+        .status-autopilot { color: #00ffaa; font-weight: bold; text-shadow: 0 0 8px #00ffaa; }
+        .status-manual { color: #ff3333; font-weight: bold; text-shadow: 0 0 8px #ff3333; }
+        .status-warning { color: #ffaa00; font-weight: bold; animation: blink 0.5s infinite; margin-top: 10px;}
+        @keyframes blink { 50% { opacity: 0.2; } }
+        #thermal-ui {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            pointer-events: none;
+            z-index: 20;
+            border: 2px solid #ff0000;
+            box-sizing: border-box;
+            background: rgba(255, 0, 0, 0.05);
+        }
+    </style>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/Sky.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.7.9/dat.gui.min.js"></script>
+</head>
+<body>
+    <div id="info">
+        <h2>Helium Drone Sim</h2>
+        <p>Status: <span id="ap-status" class="status-manual">MANUAL</span></p>
+        <p>Wind/Turbulence: <span id="turb-status">0%</span></p>
+        <p id="stress-warning" class="status-warning" style="display:none;">⚠️ HIGH STRUCTURAL STRESS ⚠️</p>
+        <p style="font-size:12px; color:#aaa; margin-top:15px; line-height: 1.4;">
+            Simulating a morning flood rescue. Aerodynamic smoke trails show air drag over the translucent balloons.
+        </p>
+    </div>
+    
+    <div id="thermal-ui">
+        <span style="color:#ffcc00; font-family:monospace; position:absolute; top:5px; left:5px; font-weight:bold; font-size: 14px;">REC // THERMAL</span>
+        <span style="color:#ffcc00; font-family:monospace; position:absolute; bottom:5px; right:5px; font-size: 14px;">CAM 2</span>
+        
+        <!-- Crosshair -->
+        <div style="position:absolute; top:50%; left:50%; width:30px; height:30px; border:2px solid rgba(255,200,0,0.5); transform:translate(-50%,-50%);"></div>
+        <div style="position:absolute; top:50%; left:50%; width:4px; height:4px; background:#ffcc00; transform:translate(-50%,-50%);"></div>
+        
+        <!-- Temperature Readout -->
+        <div id="thermal-temp" style="position:absolute; top:50%; left:50%; transform:translate(25px, -50%); color:#ffcc00; font-family:monospace; font-size:16px; font-weight:bold;">--.-°C</div>
+
+        <!-- Color Scale Legend -->
+        <div style="position:absolute; right:10px; top:20%; height:60%; width:15px; background: linear-gradient(to top, #110088, #8800cc, #ff3300, #ffcc00, #ffffff); border: 1px solid #000;"></div>
+        <span style="position:absolute; right:30px; top:20%; color:#fff; font-family:monospace; font-size:10px;">40°C</span>
+        <span style="position:absolute; right:30px; bottom:20%; color:#fff; font-family:monospace; font-size:10px;">10°C</span>
+    </div>
+    
+    <script>
+        let scene, camera, thermalCamera, renderer, controls, sky, sun;
+        let droneGroup, rotors = [], balloons = [];
+        let water, windWaves = [], debris = [], people = [];
+        let gui;
+        
+        const params = {
+            windSpeed: 30,
+            autopilot: true,
+            altitude: 15,
+            cameraAngle: -30,
+            heliumVolume: 1.0,
+            showSmokeTrails: true,
+            droneYaw: 0
+        };
+
+        const uniforms = {
+            uTime: { value: 0.0 },
+            uStress: { value: 0.0 }
+        };
+
+        let time = 0;
+
+        // Thermal Materials (Ironbow Palette)
+        const thermalPalette = {
+            cold: new THREE.MeshBasicMaterial({color: 0x110088}), // Deep blue (water)
+            cool: new THREE.MeshBasicMaterial({color: 0x8800cc}), // Purple (buildings)
+            warm: new THREE.MeshBasicMaterial({color: 0xff3300}), // Red/Orange (drone parts)
+            hot: new THREE.MeshBasicMaterial({color: 0xffcc00})   // Yellow (humans)
+        };
+        
+        const raycaster = new THREE.Raycaster();
+        const screenCenter = new THREE.Vector2(0, 0);
+
+        init();
+        animate();
+
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0xcceeff, 0.003); // Light morning fog
+
+            camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.set(30, 20, 35);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.toneMapping = THREE.ACESFilmicToneMapping;
+            renderer.toneMappingExposure = 0.5;
+            document.body.appendChild(renderer.domElement);
+
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.maxPolarAngle = Math.PI / 2 + 0.05;
+
+            setupSkyAndLighting();
+            createEnvironment();
+            createHeliumDrone();
+            setupGUI();
+
+            window.addEventListener('resize', onWindowResize);
+            onWindowResize(); // Init thermal UI size
+        }
+
+        function setupSkyAndLighting() {
+            // Realistic Sky
+            sky = new THREE.Sky();
+            sky.scale.setScalar(10000);
+            scene.add(sky);
+
+            sun = new THREE.Vector3();
+            const skyUniforms = sky.material.uniforms;
+            skyUniforms['turbidity'].value = 10;
+            skyUniforms['rayleigh'].value = 2;
+            skyUniforms['mieCoefficient'].value = 0.005;
+            skyUniforms['mieDirectionalG'].value = 0.8;
+
+            // Morning Sun Position
+            const elevation = 15;
+            const azimuth = 180;
+            const phi = THREE.MathUtils.degToRad(90 - elevation);
+            const theta = THREE.MathUtils.degToRad(azimuth);
+            sun.setFromSphericalCoords(1, phi, theta);
+            skyUniforms['sunPosition'].value.copy(sun);
+
+            // Lighting
+            const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+            scene.add(ambient);
+            
+            const sunLight = new THREE.DirectionalLight(0xfff5e6, 2.0);
+            sunLight.position.copy(sun).multiplyScalar(100);
+            scene.add(sunLight);
+        }
+
+        // --- Custom Stress Shader (Red Extremities) ---
+        function applyStressShader(material) {
+            material.onBeforeCompile = function(shader) {
+                shader.uniforms.uStress = uniforms.uStress;
+                shader.vertexShader = `varying vec3 vLocalPos;\n` + shader.vertexShader;
+                shader.vertexShader = shader.vertexShader.replace(
+                    `#include <begin_vertex>`,
+                    `#include <begin_vertex>\nvLocalPos = position;`
+                );
+                shader.fragmentShader = `uniform float uStress;\nvarying vec3 vLocalPos;\n` + shader.fragmentShader;
+                shader.fragmentShader = shader.fragmentShader.replace(
+                    `#include <emissivemap_fragment>`,
+                    `#include <emissivemap_fragment>
+                     float dist = length(vLocalPos);
+                     float stressFactor = smoothstep(1.0, 8.0, dist) * uStress;
+                     diffuseColor.rgb = mix(diffuseColor.rgb, vec3(1.0, 0.1, 0.0), clamp(stressFactor, 0.0, 0.9));
+                     totalEmissiveRadiance += vec3(1.0, 0.0, 0.0) * clamp(stressFactor * 1.5, 0.0, 1.0);
+                    `
+                );
+            };
+        }
+
+        // --- Drone Construction ---
+        function createHeliumDrone() {
+            droneGroup = new THREE.Group();
+            droneGroup.position.y = 15;
+            scene.add(droneGroup);
+
+            // Materials
+            const carbonMat = new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.7, metalness: 0.2 });
+            const metalMat = new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.3, metalness: 0.8 });
+            
+            // Translucent Milky Balloon Material
+            const translucentMat = new THREE.MeshPhysicalMaterial({ 
+                color: 0xeeeeee, 
+                transmission: 0.6, 
+                opacity: 0.8, 
+                transparent: true,
+                roughness: 0.2, 
+                metalness: 0.1, 
+                ior: 1.4, 
+                thickness: 1.0,
+                side: THREE.DoubleSide
+            });
+            const electronicMat = new THREE.MeshStandardMaterial({ color: 0x22aa22, roughness: 0.8 });
+
+            applyStressShader(carbonMat);
+            applyStressShader(metalMat);
+
+            // Central Chassis
+            const chassisGeo = new THREE.BoxGeometry(4, 1, 3);
+            const chassis = new THREE.Mesh(chassisGeo, metalMat);
+            droneGroup.add(chassis);
+
+            // Camera/Sensor Payload
+            const payloadGeo = new THREE.CylinderGeometry(0.5, 0.5, 1.5, 16);
+            const payload = new THREE.Mesh(payloadGeo, carbonMat);
+            payload.rotation.x = Math.PI / 2;
+            payload.position.set(0, -1, 1.5);
+            droneGroup.add(payload);
+            
+            const lensGeo = new THREE.SphereGeometry(0.3, 16, 16);
+            const lens = new THREE.Mesh(lensGeo, new THREE.MeshBasicMaterial({color: 0x000000}));
+            lens.position.set(0, -1, 2.2);
+            droneGroup.add(lens);
+
+            // Thermal Camera Setup
+            thermalCamera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            thermalCamera.position.set(0, -1.5, 2.2);
+            thermalCamera.lookAt(0, -30, -50); // Look down and slightly forward
+            droneGroup.add(thermalCamera);
+
+            // Arms (X shape)
+            const armGeo = new THREE.CylinderGeometry(0.15, 0.15, 16);
+            const arm1 = new THREE.Mesh(armGeo, carbonMat);
+            arm1.rotation.z = Math.PI / 2;
+            arm1.position.z = 2;
+            droneGroup.add(arm1);
+
+            const arm2 = new THREE.Mesh(armGeo, carbonMat);
+            arm2.rotation.z = Math.PI / 2;
+            arm2.position.z = -2;
+            droneGroup.add(arm2);
+
+            // Rotors
+            const rotorPositions = [
+                new THREE.Vector3(8, 0.5, 2),
+                new THREE.Vector3(-8, 0.5, 2),
+                new THREE.Vector3(8, 0.5, -2),
+                new THREE.Vector3(-8, 0.5, -2),
+            ];
+
+            rotorPositions.forEach(pos => {
+                const rotorGroup = new THREE.Group();
+                rotorGroup.position.copy(pos);
+                
+                // Motor hub
+                const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 0.6), metalMat);
+                rotorGroup.add(hub);
+
+                // Blades
+                const bladeGeo = new THREE.BoxGeometry(4, 0.05, 0.3);
+                const blade = new THREE.Mesh(bladeGeo, carbonMat);
+                blade.position.y = 0.3;
+                rotorGroup.add(blade);
+                
+                const blade2 = new THREE.Mesh(bladeGeo, carbonMat);
+                blade2.rotation.y = Math.PI / 2;
+                blade2.position.y = 0.3;
+                rotorGroup.add(blade2);
+
+                droneGroup.add(rotorGroup);
+                rotors.push(rotorGroup);
+            });
+
+            // Helium Balloons (Spheres stretched into blimps)
+            const balloonGeo = new THREE.SphereGeometry(2.5, 32, 32);
+            
+            const balloonLGroup = new THREE.Group();
+            balloonLGroup.position.set(4, 0, 0);
+            balloonLGroup.rotation.x = Math.PI / 2;
+            
+            const balloonL = new THREE.Mesh(balloonGeo, translucentMat);
+            balloonL.scale.set(1, 2.5, 1);
+            balloonLGroup.add(balloonL);
+            
+            // Internal Electronics (inside balloon L)
+            const elecL = new THREE.Mesh(new THREE.BoxGeometry(1.5, 4, 1), electronicMat);
+            elecL.position.y = -2;
+            balloonLGroup.add(elecL);
+
+            droneGroup.add(balloonLGroup);
+            balloons.push(balloonLGroup);
+
+            const balloonRGroup = new THREE.Group();
+            balloonRGroup.position.set(-4, 0, 0);
+            balloonRGroup.rotation.x = Math.PI / 2;
+
+            const balloonR = new THREE.Mesh(balloonGeo, translucentMat);
+            balloonR.scale.set(1, 2.5, 1);
+            balloonRGroup.add(balloonR);
+
+            // Internal Electronics (inside balloon R)
+            const elecR = new THREE.Mesh(new THREE.BoxGeometry(1.5, 4, 1), electronicMat);
+            elecR.position.y = -2;
+            balloonRGroup.add(elecR);
+
+            droneGroup.add(balloonRGroup);
+            balloons.push(balloonRGroup);
+
+            // Mark drone components for thermal camera
+            droneGroup.traverse(c => {
+                if(c.isMesh) c.userData.isDrone = true;
+            });
+        }
+
+        // --- Flood Environment ---
+        function createEnvironment() {
+            // Choppy Flood Water
+            const waterGeo = new THREE.PlaneGeometry(2000, 2000, 100, 100);
+            const waterMat = new THREE.MeshStandardMaterial({
+                color: 0x227799, roughness: 0.1, metalness: 0.8, transparent: true, opacity: 0.9
+            });
+            
+            waterMat.onBeforeCompile = (shader) => {
+                shader.uniforms.uTime = uniforms.uTime;
+                shader.uniforms.uWind = uniforms.uStress;
+                shader.vertexShader = `uniform float uTime;\nuniform float uWind;\n` + shader.vertexShader;
+                shader.vertexShader = shader.vertexShader.replace(
+                    `#include <begin_vertex>`,
+                    `
+                    vec3 transformed = vec3(position);
+                    float wave1 = sin(position.x * 0.1 + uTime * 2.0) * cos(position.y * 0.1 + uTime);
+                    float wave2 = sin(position.x * 0.3 - uTime * 3.0) * 1.5;
+                    transformed.z += (wave1 + wave2) * (0.5 + uWind * 2.0);
+                    `
+                );
+            };
+
+            water = new THREE.Mesh(waterGeo, waterMat);
+            water.rotation.x = -Math.PI / 2;
+            scene.add(water);
+
+            // Submerged terrain/grades (Hills sticking out)
+            const terrainGeo = new THREE.PlaneGeometry(1500, 1500, 64, 64);
+            const terrainMat = new THREE.MeshStandardMaterial({ color: 0x334422, roughness: 1.0 });
+            
+            // Displace terrain vertices to make hills
+            const pos = terrainGeo.attributes.position.array;
+            for(let i=0; i<pos.length; i+=3) {
+                const x = pos[i];
+                const y = pos[i+1];
+                pos[i+2] = Math.sin(x * 0.01) * Math.cos(y * 0.01) * 30 + Math.sin(x * 0.05) * 5;
+            }
+            terrainGeo.computeVertexNormals();
+            const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+            terrain.rotation.x = -Math.PI / 2;
+            terrain.position.y = -10; // Mostly underwater
+            scene.add(terrain);
+
+            // --- Procedural Building Texture ---
+            const canvas = document.createElement('canvas');
+            canvas.width = 256;
+            canvas.height = 256;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#666';
+            ctx.fillRect(0, 0, 256, 256);
+            ctx.fillStyle = '#222'; // Windows
+            for(let x=10; x<256; x+=40) {
+                for(let y=10; y<256; y+=50) {
+                    ctx.fillRect(x, y, 20, 30);
+                }
+            }
+            const bldgTexture = new THREE.CanvasTexture(canvas);
+            bldgTexture.wrapS = THREE.RepeatWrapping;
+            bldgTexture.wrapT = THREE.RepeatWrapping;
+            bldgTexture.magFilter = THREE.NearestFilter;
+            
+            const buildingMat = new THREE.MeshStandardMaterial({ map: bldgTexture, roughness: 0.9 });
+
+            // Helper to make a human
+            function createHuman(colorHex) {
+                const group = new THREE.Group();
+                const mat = new THREE.MeshStandardMaterial({ color: colorHex });
+                const skin = new THREE.MeshStandardMaterial({ color: 0xffccaa });
+                
+                const head = new THREE.Mesh(new THREE.SphereGeometry(0.3, 16, 16), skin);
+                head.position.y = 1.8;
+                group.add(head);
+                
+                const torso = new THREE.Mesh(new THREE.BoxGeometry(0.8, 1.2, 0.4), mat);
+                torso.position.y = 1.0;
+                group.add(torso);
+                
+                const armGeo = new THREE.CylinderGeometry(0.15, 0.15, 1.0);
+                const armL = new THREE.Mesh(armGeo, skin);
+                armL.position.set(-0.6, 1.2, 0);
+                armL.rotation.z = Math.PI / 4; // Waving
+                group.add(armL);
+                
+                const armR = new THREE.Mesh(armGeo, skin);
+                armR.position.set(0.6, 1.2, 0);
+                armR.rotation.z = -Math.PI / 4;
+                group.add(armR);
+                
+                const legGeo = new THREE.CylinderGeometry(0.2, 0.2, 1.2);
+                const legL = new THREE.Mesh(legGeo, mat);
+                legL.position.set(-0.25, -0.2, 0);
+                group.add(legL);
+                
+                const legR = new THREE.Mesh(legGeo, mat);
+                legR.position.set(0.25, -0.2, 0);
+                group.add(legR);
+                
+                group.userData = { armL, armR };
+                
+                // Mark for thermal
+                group.traverse(c => {
+                    if(c.isMesh) c.userData.isHuman = true;
+                });
+
+                return group;
+            }
+
+            // Flooded Buildings & People
+            const bldgPositions = [
+                {x: -40, z: -60, w: 20, h: 80, d: 20},
+                {x: -70, z: -40, w: 25, h: 60, d: 25},
+                {x: 50,  z: -70, w: 30, h: 90, d: 20},
+                {x: 10,  z: -80, w: 40, h: 70, d: 30}
+            ];
+
+            bldgPositions.forEach(pos => {
+                const bGeo = new THREE.BoxGeometry(pos.w, pos.h, pos.d);
+                // Repeat texture based on size
+                const bMat = buildingMat.clone();
+                bMat.map = bldgTexture.clone();
+                bMat.map.needsUpdate = true;
+                bMat.map.repeat.set(pos.w / 10, pos.h / 15);
+
+                const bldg = new THREE.Mesh(bGeo, bMat);
+                bldg.position.set(pos.x, -10 + (pos.h/2 - 30), pos.z); // Adjust so some stick out
+                scene.add(bldg);
+
+                // Add 2-3 humans per roof
+                const roofY = bldg.position.y + pos.h/2;
+                const numHumans = 2 + Math.floor(Math.random() * 2);
+                for(let i=0; i<numHumans; i++) {
+                    const colors = [0xff0000, 0x0000ff, 0x00aa00, 0xffff00];
+                    const human = createHuman(colors[Math.floor(Math.random() * colors.length)]);
+                    human.position.set(
+                        pos.x + (Math.random() - 0.5) * (pos.w - 2), 
+                        roofY, 
+                        pos.z + (Math.random() - 0.5) * (pos.d - 2)
+                    );
+                    human.userData.phase = Math.random() * Math.PI * 2;
+                    human.userData.roofY = roofY;
+                    scene.add(human);
+                    people.push(human);
+                }
+            });
+
+            // Floating Debris & Fallen Trees
+            const crateGeo = new THREE.BoxGeometry(2, 2, 2);
+            const treeGeo = new THREE.CylinderGeometry(1, 1, 15);
+            const woodMat = new THREE.MeshStandardMaterial({ color: 0x443322, roughness: 0.9 });
+            
+            for(let i=0; i<30; i++) {
+                const isTree = Math.random() > 0.5;
+                const deb = new THREE.Mesh(isTree ? treeGeo : crateGeo, woodMat);
+                deb.position.set((Math.random() - 0.5) * 300, 0, (Math.random() - 0.5) * 300);
+                
+                if (isTree) {
+                    deb.rotation.set(Math.PI/2, 0, Math.random() * Math.PI);
+                } else {
+                    deb.rotation.set(Math.random(), Math.random(), Math.random());
+                    deb.scale.set(1 + Math.random()*2, 1, 1 + Math.random()*3);
+                }
+                
+                deb.userData = { phase: Math.random() * Math.PI * 2, speed: 1 + Math.random() };
+                scene.add(deb);
+                debris.push(deb);
+            }
+
+            // Aerodynamic Smoke Trails (Wind Tunnel style)
+            const smokeLineMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
+            for(let i=0; i<30; i++) {
+                const points = [];
+                for(let j=0; j<100; j++) points.push(new THREE.Vector3(0, 0, 0));
+                const geo = new THREE.BufferGeometry().setFromPoints(points);
+                const line = new THREE.Line(geo, smokeLineMat);
+                
+                // Position trails in a grid in front of the drone
+                line.userData = {
+                    baseX: (Math.random() - 0.5) * 25,
+                    baseY: 10 + (Math.random() - 0.5) * 15,
+                    phase: Math.random() * Math.PI * 2
+                };
+                scene.add(line);
+                windWaves.push(line);
+            }
+        }
+
+        function setupGUI() {
+            gui = new dat.GUI({ width: 300 });
+            gui.add(params, 'windSpeed', 0, 100).name('Wind / Turbulence').onChange(v => {
+                uniforms.uStress.value = v / 100;
+            });
+            gui.add(params, 'altitude', 5, 50).name('Drone Altitude');
+            gui.add(params, 'cameraAngle', -90, 0).name('Thermal Cam Angle');
+            gui.add(params, 'autopilot').name('Active Stabilizers').onChange(updateUI);
+            gui.add(params, 'heliumVolume', 0.5, 2.0).name('Helium Balloon Vol').onChange(updateBalloons);
+            gui.add(params, 'showSmokeTrails').name('Aero Smoke Trails').onChange(v => {
+                windWaves.forEach(w => w.visible = v);
+            });
+            gui.add(params, 'droneYaw', -180, 180).name('Drone Yaw Axis');
+            updateUI();
+        }
+
+        function updateUI() {
+            const apStatus = document.getElementById('ap-status');
+            if(params.autopilot) {
+                apStatus.innerText = "AUTOPILOT: STABILIZERS ON";
+                apStatus.className = "status-autopilot";
+            } else {
+                apStatus.innerText = "MANUAL: VULNERABLE TO WIND";
+                apStatus.className = "status-manual";
+            }
+        }
+
+        function updateBalloons() {
+            balloons.forEach(b => {
+                b.scale.set(params.heliumVolume, 2.5, params.heliumVolume);
+            });
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            if(thermalCamera) {
+                thermalCamera.aspect = window.innerWidth / window.innerHeight;
+                thermalCamera.updateProjectionMatrix();
+            }
+            renderer.setSize(window.innerWidth, window.innerHeight);
+
+            // Update Thermal UI bounding box
+            const ui = document.getElementById('thermal-ui');
+            ui.style.width = (window.innerWidth * 0.25) + 'px';
+            ui.style.height = (window.innerHeight * 0.25) + 'px';
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 0.05;
+            uniforms.uTime.value = time;
+
+            // Animate Debris
+            debris.forEach(deb => {
+                deb.position.y = Math.sin(time * deb.userData.speed + deb.userData.phase) * 0.5;
+                deb.position.z += 0.1 + (params.windSpeed * 0.01);
+                if(deb.position.z > 150) deb.position.z = -150;
+            });
+
+            // Animate People jumping on roof
+            people.forEach(p => {
+                p.userData.phase += 0.2;
+                p.position.y = p.userData.roofY + Math.abs(Math.sin(p.userData.phase)) * 2.0; // Bouncing
+                
+                // Waving arms
+                if(p.userData.armL) {
+                    p.userData.armL.rotation.x = Math.sin(p.userData.phase * 1.5) * 0.5;
+                    p.userData.armR.rotation.x = Math.sin(p.userData.phase * 1.5 + Math.PI) * 0.5;
+                }
+            });
+
+            // Aerodynamic Smoke Trails Deflection over drone
+            if(params.showSmokeTrails && droneGroup) {
+                const droneZ = droneGroup.position.z;
+                const windFlowSpeed = 1.0 + (params.windSpeed * 0.05);
+                
+                windWaves.forEach(wave => {
+                    wave.userData.phase -= windFlowSpeed;
+                    const positions = wave.geometry.attributes.position.array;
+                    
+                    for(let i=0; i<100; i++) {
+                        const zWorld = 50 - i; 
+                        let x = wave.userData.baseX;
+                        let y = wave.userData.baseY;
+                        const dz = zWorld - droneZ;
+                        const distToDroneZ = Math.abs(dz);
+                        
+                        if(distToDroneZ < 15) {
+                            const deflect = Math.cos(distToDroneZ * (Math.PI / 30)) * 5.0 * params.heliumVolume;
+                            if (x > 0) x += deflect; else x -= deflect;
+                            if (y > 15) y += deflect; else y -= deflect;
+                        }
+
+                        x += Math.sin(zWorld * 0.5 + wave.userData.phase) * (params.windSpeed * 0.01);
+                        y += Math.cos(zWorld * 0.3 + wave.userData.phase) * (params.windSpeed * 0.01);
+
+                        positions[i*3] = x;
+                        positions[i*3+1] = y;
+                        positions[i*3+2] = zWorld;
+                    }
+                    wave.geometry.attributes.position.needsUpdate = true;
+                });
+            }
+
+            // High turbulence stress UI
+            const stressWarning = document.getElementById('stress-warning');
+            if(params.windSpeed > 75) {
+                stressWarning.style.display = 'block';
+            } else {
+                stressWarning.style.display = 'none';
+            }
+
+            // Drone Physics & Active Stabilizers
+            if (droneGroup) {
+                let shakeFactor = params.windSpeed * 0.005;
+                
+                rotors.forEach(r => {
+                    r.rotation.y += 0.2 + (params.windSpeed * 0.01);
+                });
+                
+                if (params.autopilot) {
+                    const targetTiltX = -params.windSpeed * 0.006; 
+                    droneGroup.rotation.x += (targetTiltX - droneGroup.rotation.x) * 0.1;
+                    droneGroup.position.y = params.altitude + Math.sin(time * 5) * (shakeFactor * 0.15);
+                    droneGroup.rotation.z += (0 - droneGroup.rotation.z) * 0.1;
+                } else {
+                    droneGroup.rotation.x = Math.sin(time * 2.1) * shakeFactor;
+                    droneGroup.rotation.z = Math.cos(time * 1.7) * shakeFactor;
+                    droneGroup.position.y = params.altitude + Math.sin(time * 3.5) * shakeFactor * 2;
+                }
+                
+                const targetYaw = THREE.MathUtils.degToRad(params.droneYaw);
+                droneGroup.rotation.y += (targetYaw - droneGroup.rotation.y) * 0.05;
+            }
+
+            if (thermalCamera) {
+                thermalCamera.rotation.x = THREE.MathUtils.degToRad(params.cameraAngle);
+            }
+
+            document.getElementById('turb-status').innerText = Math.round(params.windSpeed) + '%';
+
+            // --- Multi-Pass Rendering ---
+            
+            // 1. Render Main Scene
+            renderer.autoClear = true;
+            renderer.setViewport(0, 0, window.innerWidth, window.innerHeight);
+            renderer.setScissorTest(false);
+            controls.update();
+            renderer.render(scene, camera);
+
+            // 2. Render Thermal POV
+            if(thermalCamera) {
+                // Raycast for center temperature
+                raycaster.setFromCamera(screenCenter, thermalCamera);
+                // Intersect scene children except lines/lights
+                const intersects = raycaster.intersectObjects(scene.children, true);
+                let detectedTemp = 15.0; // Default ambient
+                if (intersects.length > 0) {
+                    const hit = intersects[0].object;
+                    if (hit.userData.isHuman) detectedTemp = 36.5 + Math.random() * 0.5;
+                    else if (hit.userData.isDrone) detectedTemp = 45.0 + Math.random() * 2.0;
+                    else if (hit.geometry && hit.geometry.type === 'BoxGeometry') detectedTemp = 22.0 + Math.random(); // Building approx
+                    else detectedTemp = 14.0 + Math.random() * 0.5;
+                }
+                
+                const tempEl = document.getElementById('thermal-temp');
+                tempEl.innerText = detectedTemp.toFixed(1) + '°C';
+                if(detectedTemp > 35) tempEl.style.color = '#ffffff'; // Hot
+                else if(detectedTemp > 20) tempEl.style.color = '#ffcc00'; // Warm
+                else tempEl.style.color = '#8800cc'; // Cold
+                
+                renderer.autoClear = false; // Do not clear main scene
+                
+                // Swap materials
+                scene.traverse(c => {
+                    if (c.isMesh && c.material) {
+                        c.userData.normalMat = c.material; // Backup
+                        
+                        if (c.userData.isHuman) {
+                            c.material = thermalPalette.hot;
+                        } else if (c.userData.isDrone) {
+                            c.material = thermalPalette.warm;
+                        } else if (c.geometry && c.geometry.type === 'BoxGeometry') {
+                            c.material = thermalPalette.cool;
+                        } else {
+                            c.material = thermalPalette.cold;
+                        }
+                    }
+                    if (c.isLine) {
+                        c.userData.wasVisible = c.visible;
+                        c.visible = false;
+                    }
+                });
+
+                // Disable fog/sky for pure thermal contrast
+                const oldFog = scene.fog;
+                const oldBg = scene.background;
+                scene.fog = null;
+                scene.background = new THREE.Color(0x000000);
+
+                // Setup Picture-in-Picture viewport
+                const tw = window.innerWidth * 0.25;
+                const th = window.innerHeight * 0.25;
+                renderer.setViewport(20, 20, tw, th);
+                renderer.setScissor(20, 20, tw, th);
+                renderer.setScissorTest(true);
+                
+                renderer.render(scene, thermalCamera);
+
+                // Restore Main Scene
+                scene.traverse(c => {
+                    if (c.isMesh && c.userData.normalMat) {
+                        c.material = c.userData.normalMat;
+                    }
+                    if (c.isLine && c.userData.wasVisible !== undefined) {
+                        c.visible = c.userData.wasVisible;
+                    }
+                });
+                scene.fog = oldFog;
+                scene.background = oldBg;
+            }
+        }
+    </script>
+</body>
+</html>
